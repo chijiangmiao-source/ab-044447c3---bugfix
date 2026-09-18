@@ -11,9 +11,13 @@ marked complete only after the publish survives an fsync, so a restart can
 never mistake a confirmed chunk for a missing one.
 
 Confirmed chunk files are written once (temp-file + fsync + rename) and never
-modified or deleted, so range previews can stream them directly: a cross-chunk
-read opens the affected chunk files in turn and never materializes a whole
-copy of the scan.
+modified or deleted by normal operation, so range previews can stream them
+directly: a cross-chunk read opens the affected chunk files in turn and never
+materializes a whole copy of the scan. The one exception is self-healing:
+:func:`save_chunk_atomic` is also invoked to restore a confirmed chunk whose
+payload went missing or corrupt, always with digest-identical bytes from a
+same-content retransmit (the rename is atomic and the replacing bytes verify
+against the same recorded SHA-256).
 """
 from __future__ import annotations
 

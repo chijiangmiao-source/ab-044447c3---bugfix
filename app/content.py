@@ -12,11 +12,13 @@ scan is still uploading and after it is published:
 * **complete session** — bytes are streamed from the atomically published
   file. Without a ``Range`` header the whole file is returned as ``200``.
 
-Confirmed chunk files are write-once/immutable, so the snapshot taken by
-:func:`app.services.load_snapshot` stays valid for the storage reads and the
-response: a concurrent upload can only add new chunk files, never change the
-ones being streamed. Cross-chunk spans open each touched chunk in turn and
-never assemble a temporary whole-file copy.
+Confirmed chunk files are write-once/immutable in normal operation, so the
+snapshot taken by :func:`app.services.load_snapshot` stays valid for the
+storage reads and the response: a concurrent upload can only add new chunk
+files. The sole exception is self-healing — a same-content retransmit may
+atomically replace a missing/corrupt payload with digest-identical bytes,
+which cannot change what a validated stream serves. Cross-chunk spans open
+each touched chunk in turn and never assemble a temporary whole-file copy.
 """
 from __future__ import annotations
 

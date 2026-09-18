@@ -215,6 +215,126 @@ def test_chunk_present_in_db_but_missing_on_disk_is_unavailable(client, data_env
     assert ok.status_code == 206 and ok.content == content[0:10]
 
 
+def test_same_content_reupload_after_payload_loss_self_heals(client, data_env):
+    # Exact acceptance scenario: content "AB" with a 1-byte chunk size, i.e.
+    # at least two chunks. Confirm chunk 0, then lose only its payload file
+    # while the confirming database row survives.
+    from app import storage
+
+    content = b"AB"
+    s = _open_session(client, content, 1)
+    uid = s["upload_id"]
+    parts = split(content, 1)
+    _confirm(client, uid, parts, [0])
+
+    # Persistence fault: confirming row remains, payload file is gone.
+    target = storage.chunk_path(uid, 0)
+    assert target.is_file()
+    target.unlink()
+
+    # The range gate reports the chunk missing and points the client at a
+    # re-upload; no scan bytes leak.
+    blocked = _get(client, uid, "bytes=0-0")
+    assert blocked.status_code == 409
+    details = blocked.json()["error"]["details"]
+    assert details["missing_chunks"] == [0]
+    assert details["corrupt_chunks"] == []
+
+    # Follow the error guidance: re-upload the *identical* chunk 0.
+    repaired = put_chunk(client, uid, 0, parts[0])
+    assert repaired.status_code == 200, repaired.text
+    body = repaired.json()
+    assert body["idempotent"] is True  # same content -> still idempotent
+    assert body["chunks_received"] == 1  # bitmap untouched
+
+    # The payload is durably back on disk and byte-identical.
+    assert target.is_file()
+    assert target.read_bytes() == parts[0]
+
+    # The session self-heals: the same range now serves byte A as 206.
+    healed = _get(client, uid, "bytes=0-0")
+    assert healed.status_code == 206, healed.text
+    assert healed.content == b"A"
+    assert healed.headers["content-range"] == "bytes 0-0/2"
+    # Confirming row / status were not polluted by the recovery.
+    st = status(client, uid).json()
+    assert st["status"] == "open"
+    assert st["chunks_received"] == 1
+    assert st["missing_chunks"] == [1]
+
+    # Healing persists across a restart (payload is real, not an in-memory fix).
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+
+    with TestClient(create_app()) as restarted:
+        seen = _get(restarted, uid, "bytes=0-0")
+        assert seen.status_code == 206 and seen.content == b"A"
+        # Uploading the remaining chunk then completes the session.
+        r = put_chunk(restarted, uid, 1, parts[1])
+        assert r.status_code == 200 and r.json()["complete"] is True
+        whole = _get(restarted, uid, None)
+        assert whole.status_code == 200 and whole.content == content
+
+
+def test_same_content_reupload_repairs_corrupt_payload(client, data_env):
+    # Same self-healing path when the payload file exists but no longer
+    # matches its recorded digest (bit rot), rather than being absent.
+    from app import storage
+
+    content = _content(250, b"heal-rot")
+    s = _open_session(client, content, 100)
+    uid = s["upload_id"]
+    parts = split(content, 100)
+    _confirm(client, uid, parts, [0, 1])
+
+    p1 = storage.chunk_path(uid, 1)
+    tampered = bytearray(p1.read_bytes())
+    tampered[0] ^= 0xFF
+    p1.write_bytes(bytes(tampered))
+
+    blocked = _get(client, uid, "bytes=150-160")
+    assert blocked.status_code == 409
+    assert blocked.json()["error"]["details"]["corrupt_chunks"] == [1]
+
+    repaired = put_chunk(client, uid, 1, parts[1])
+    assert repaired.status_code == 200
+    assert repaired.json()["idempotent"] is True
+    assert p1.read_bytes() == parts[1]
+
+    healed = _get(client, uid, "bytes=150-160")
+    assert healed.status_code == 206
+    assert healed.content == content[150:161]
+
+
+def test_reupload_that_restores_missing_payload_completes_session(client, data_env):
+    # Recovery on an open session that is one payload short: once the lost
+    # payload is healed idempotently, uploading the last *unconfirmed* chunk
+    # drives the normal atomic assembly and publication.
+    from app import storage
+
+    content = _content(250, b"heal-done")
+    s = _open_session(client, content, 100)
+    uid = s["upload_id"]
+    parts = split(content, 100)
+    _confirm(client, uid, parts, [0, 1])
+
+    # Lose chunk 0's payload; chunk 2 is still unconfirmed, so the session is
+    # open with chunk 0 "confirmed but missing on disk".
+    storage.chunk_path(uid, 0).unlink()
+    assert _get(client, uid, "bytes=0-9").status_code == 409
+
+    # Heal chunk 0, then confirm the genuinely missing chunk 2.
+    healed = put_chunk(client, uid, 0, parts[0])
+    assert healed.status_code == 200 and healed.json()["idempotent"] is True
+    final = put_chunk(client, uid, 2, parts[2])
+    assert final.status_code == 200 and final.json()["complete"] is True
+    st = status(client, uid).json()
+    assert st["status"] == "complete"
+    assert _get(client, uid, "bytes=0-9").content == content[0:10]
+    assert _get(client, uid, None).content == content
+
+
 def test_corrupt_chunk_payload_is_409_with_corrupt_indexes(client, data_env):
     content = _content(350, b"rot")
     s = _open_session(client, content, 100)

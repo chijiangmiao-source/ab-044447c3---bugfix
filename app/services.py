@@ -3,6 +3,12 @@
 All state transitions are serialized by :func:`app.db.write_tx`; chunk bytes
 are fsynced *before* their confirming row is committed, which is what lets a
 restart resume exactly from confirmed positions.
+
+A confirmed row whose payload later goes missing or corrupt on disk (a
+persistence fault) is not a permanent condition: re-uploading the *same*
+bytes for that index stays idempotent and atomically restores the payload,
+so a ``409 range_unavailable`` listing the index is genuinely recoverable by
+following its "re-upload the listed chunks" guidance.
 """
 from __future__ import annotations
 
@@ -219,7 +225,7 @@ def receive_chunk(upload_id: str, index: int, claimed_sha256: str, body: bytes) 
     newly_inserted = False
     with db.write_tx() as conn:
         existing = conn.execute(
-            "SELECT sha256 FROM chunks WHERE upload_id = ? AND chunk_index = ?",
+            "SELECT sha256, size FROM chunks WHERE upload_id = ? AND chunk_index = ?",
             (upload_id, index),
         ).fetchone()
         if existing is not None:
@@ -234,6 +240,19 @@ def receive_chunk(upload_id: str, index: int, claimed_sha256: str, body: bytes) 
                     },
                 )
             idempotent = True
+            # Self-healing: the confirming row may outlive its payload after a
+            # persistence fault (payload file deleted/corrupted while the row
+            # survived). A same-content retransmit is exactly the recovery
+            # action advertised by range_unavailable, so when the on-disk
+            # payload is missing or fails its recorded digest, atomically
+            # restore it with the just-verified bytes. The database row is not
+            # modified (content is digest-identical), hence the reply stays
+            # idempotent and the bitmap is unchanged.
+            problem = storage.inspect_chunk(
+                upload_id, index, existing["size"], existing["sha256"]
+            )
+            if problem is not None:
+                storage.save_chunk_atomic(upload_id, index, body)
         else:
             # Durable payload first, confirming database row second.
             storage.save_chunk_atomic(upload_id, index, body)

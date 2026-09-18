@@ -93,6 +93,9 @@ curl -sS -X POST http://localhost:8000/api/v1/uploads \
 - 长度不符合上面的分片长度规则 → `422 invalid_upload`，**不记入位图**。
 - 实际摘要 ≠ `X-Chunk-SHA256` → `422 checksum_mismatch`，**不记入位图**。
 - 相同序号、**相同内容**重传 → `200` 且 `"idempotent": true`（断网重传安全）。
+  若该确认行对应的正文文件因持久化故障丢失或损坏，同内容重传会**原子自愈**：
+  按 temp-file + fsync + rename 重新落盘正文，数据库确认行不变，随后曾返回
+  `409 range_unavailable` 的区间即可正常读取（响应仍是幂等成功，绝不误报后继续不可用）。
 - 相同序号、**不同内容** → `409 chunk_conflict`，已存分片原封不动。
 - 会话过期后一律 → `410 session_expired`，进度不被污染。
 - 当新确认的分片补齐全部缺口时，服务自动组装并校验发布：

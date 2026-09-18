@@ -219,7 +219,7 @@ def receive_chunk(upload_id: str, index: int, claimed_sha256: str, body: bytes) 
     newly_inserted = False
     with db.write_tx() as conn:
         existing = conn.execute(
-            "SELECT sha256 FROM chunks WHERE upload_id = ? AND chunk_index = ?",
+            "SELECT sha256, size FROM chunks WHERE upload_id = ? AND chunk_index = ?",
             (upload_id, index),
         ).fetchone()
         if existing is not None:
@@ -234,6 +234,15 @@ def receive_chunk(upload_id: str, index: int, claimed_sha256: str, body: bytes) 
                     },
                 )
             idempotent = True
+            # The confirming row is intact, but external storage damage may
+            # have removed or rotated the payload. An identical retransmit is
+            # the documented recovery path, so heal the bytes atomically
+            # (temp-file + fsync + rename) instead of reporting a misleading
+            # idempotent success while the range stays unavailable.
+            if storage.inspect_chunk(
+                upload_id, index, existing["size"], existing["sha256"]
+            ) is not None:
+                storage.save_chunk_atomic(upload_id, index, body)
         else:
             # Durable payload first, confirming database row second.
             storage.save_chunk_atomic(upload_id, index, body)

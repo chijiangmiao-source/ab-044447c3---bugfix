@@ -10,10 +10,13 @@ Renames within the same directory are atomic on POSIX; the session row is
 marked complete only after the publish survives an fsync, so a restart can
 never mistake a confirmed chunk for a missing one.
 
-Confirmed chunk files are written once (temp-file + fsync + rename) and never
-modified or deleted, so range previews can stream them directly: a cross-chunk
-read opens the affected chunk files in turn and never materializes a whole
-copy of the scan.
+Confirmed chunk files are normally written once (temp-file + fsync + rename)
+and never modified or deleted, so range previews can stream them directly: a
+cross-chunk read opens the affected chunk files in turn and never materializes
+a whole copy of the scan. The sole exception is self-healing: when an
+identical retransmit arrives for a confirming row whose payload went missing or
+got corrupted externally, :func:`save_chunk_atomic` restores exactly the
+recorded bytes through the same atomic temp-file + rename path.
 """
 from __future__ import annotations
 

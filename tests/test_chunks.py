@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 
+from app import storage
 from tests.helpers import make_upload, put_chunk, split, status
 
 
@@ -68,6 +69,81 @@ def test_same_index_same_content_is_idempotent(client):
     assert body["idempotent"] is True
     assert body["chunks_received"] == 1
     assert status(client, uid).json()["chunks_received"] == 1
+
+
+def test_same_content_retransmit_self_heals_lost_payload(client, data_env):
+    # Regression: confirming row survives a lost payload; an identical
+    # retransmit must atomically restore the bytes so the session can recover
+    # instead of returning a misleading idempotent 200 with the range still
+    # permanently unavailable. Exact acceptance scenario: content "AB" with
+    # chunk_size 1 (two chunks), chunk 0's payload file deleted.
+    content = b"AB"
+    s = _session(client, content, chunk_size=1)
+    uid = s["upload_id"]
+    assert s["total_chunks"] == 2
+
+    r = put_chunk(client, uid, 0, b"A")
+    assert r.status_code == 200 and r.json()["idempotent"] is False
+
+    # Simulate a persistence failure: row remains, payload file is gone.
+    target = storage.chunk_path(uid, 0)
+    assert target.is_file()
+    target.unlink()
+
+    def get_first_byte():
+        return client.get(
+            f"/api/v1/uploads/{uid}/content", headers={"Range": "bytes=0-0"}
+        )
+
+    r = get_first_byte()
+    assert r.status_code == 409
+    details = r.json()["error"]["details"]
+    assert r.json()["error"]["code"] == "range_unavailable"
+    assert details["missing_chunks"] == [0]
+
+    # Follow the error message's guidance: re-upload exactly the same chunk.
+    r = put_chunk(client, uid, 0, b"A")
+    assert r.status_code == 200
+    assert r.json()["idempotent"] is True
+
+    # Final state after the second range request: healed and actually served.
+    r = get_first_byte()
+    assert r.status_code == 206, r.text
+    assert r.content == b"A"
+    assert r.headers["content-range"] == "bytes 0-0/2"
+    # The restored payload exists on disk and matches the recorded digest.
+    assert target.is_file() and target.read_bytes() == b"A"
+    st = status(client, uid).json()
+    assert st["status"] == "open"
+    assert st["chunks_received"] == 1
+    assert st["missing_chunks"] == [1]
+
+
+def test_same_content_retransmit_self_heals_corrupt_payload(client, data_env):
+    # Same recovery path for a rotated/corrupted payload: the bytes are
+    # overwritten atomically with the digest-confirmed retransmit.
+    content = b"AB"
+    s = _session(client, content, chunk_size=1)
+    uid = s["upload_id"]
+    assert put_chunk(client, uid, 0, b"A").status_code == 200
+
+    target = storage.chunk_path(uid, 0)
+    target.write_bytes(b"Z")  # wrong bytes, same length
+
+    r = client.get(
+        f"/api/v1/uploads/{uid}/content", headers={"Range": "bytes=0-0"}
+    )
+    assert r.status_code == 409
+    assert r.json()["error"]["details"]["corrupt_chunks"] == [0]
+
+    r = put_chunk(client, uid, 0, b"A")
+    assert r.status_code == 200 and r.json()["idempotent"] is True
+
+    r = client.get(
+        f"/api/v1/uploads/{uid}/content", headers={"Range": "bytes=0-0"}
+    )
+    assert r.status_code == 206 and r.content == b"A"
+    assert target.read_bytes() == b"A"
 
 
 def test_same_index_different_content_conflict_409(client):

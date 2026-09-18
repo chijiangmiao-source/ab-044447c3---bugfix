@@ -91,14 +91,15 @@ def payload(size: int, seed: int) -> bytes:
 
 
 def create(client: httpx.Client, content: bytes, expires_seconds: int = 3600,
-           filename: str = "axle_scan.bin", declare_digest: str | None = None) -> dict:
+           filename: str = "axle_scan.bin", declare_digest: str | None = None,
+           chunk_size: int = CHUNK_SIZE) -> dict:
     expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_seconds)
     r = client.post(
         "/api/v1/uploads",
         json={
             "filename": filename,
             "file_size": len(content),
-            "chunk_size": CHUNK_SIZE,
+            "chunk_size": chunk_size,
             "file_sha256": declare_digest or hashlib.sha256(content).hexdigest(),
             "expires_at": expiry.isoformat(),
         },
@@ -406,6 +407,52 @@ def main() -> int:
     r = client.get(f"/api/v1/uploads/{cuid}/content", headers={"Range": "bytes=0-9"})
     check("healthy chunk still previewable",
           r.status_code == 206 and r.content == corrupt[0:10], r.text[:120])
+
+    # ---- 7. lost payload self-heals on identical retransmit ---------------
+    print("[7] lost chunk payload: identical retransmit atomically restores it")
+    heal_content = b"AB"  # chunk_size 1 -> exactly two chunks, byte A and byte B
+    hsess = create(client, heal_content, chunk_size=1, filename="heal.bin")
+    huid = hsess["upload_id"]
+    check("heal session has two chunks", hsess["total_chunks"] == 2, str(hsess))
+    r = put(client, huid, 0, b"A")
+    check("heal session chunk 0 -> 200", r.status_code == 200, r.text)
+
+    # Simulate the persistence fault: confirming row stays in SQLite, only the
+    # chunk 0 payload file is removed from the shared /data volume.
+    lost = DATA_DIR / "chunks" / huid / "0"
+    check("chunk 0 payload on disk before fault", lost.is_file(), str(lost))
+    lost.unlink()
+    check("payload file removed (row retained)", not lost.exists(), str(lost))
+
+    r = client.get(f"/api/v1/uploads/{huid}/content",
+                   headers={"Range": "bytes=0-0"})
+    check("range while payload lost -> 409 range_unavailable missing [0]",
+          r.status_code == 409
+          and r.json()["error"]["code"] == "range_unavailable"
+          and r.json()["error"]["details"]["missing_chunks"] == [0],
+          r.text[:200])
+
+    # Follow the error message's guidance: re-upload exactly the same chunk.
+    r = put(client, huid, 0, b"A")
+    check("identical retransmit -> 200 idempotent",
+          r.status_code == 200 and r.json().get("idempotent") is True, r.text)
+
+    # Final state on the second range request: actually healed and served,
+    # not a misleading success with the bytes still unavailable.
+    r = client.get(f"/api/v1/uploads/{huid}/content",
+                   headers={"Range": "bytes=0-0"})
+    check("re-requested range -> 206 returning byte A (self-healed)",
+          r.status_code == 206
+          and r.content == b"A"
+          and r.headers["content-range"] == "bytes 0-0/2",
+          f"status={r.status_code} body={r.content!r}")
+    check("restored payload present on disk with correct bytes",
+          lost.is_file() and lost.read_bytes() == b"A", str(lost))
+    st = client.get(f"/api/v1/uploads/{huid}").json()
+    check("healed session bitmap intact; chunk 1 still missing",
+          st["status"] == "open"
+          and st["chunks_received"] == 1
+          and st["missing_chunks"] == [1], str(st))
 
     print(f"\n== {_passed} passed, {len(_failed)} failed ==")
     if _failed:
